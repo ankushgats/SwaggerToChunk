@@ -1,0 +1,308 @@
+Build a Java PowerPoint crawling module using LangChain4j that mirrors the 
+existing PDF crawler module structure. Plugs into the same embeddings store 
+and persistence framework.
+
+## Context
+- Existing modules: HTML crawler, PDF crawler (same pattern — follow it)
+- This is a NEW standalone module: ppt-crawler
+- Inject EmbeddingStore, EmbeddingModel, PersistenceService — do NOT reimplement
+- Framework-agnostic: no Spring annotations, constructor injection only
+
+---
+
+## Module Structure
+ppt-crawler/
+├── src/main/java/com/yourorg/ppt/
+│   ├── PptCrawlerModule.java
+│   ├── extractor/
+│   │   ├── PptExtractor.java              # Interface
+│   │   ├── ApachePptExtractor.java        # Apache POI implementation
+│   │   └── model/
+│   │       ├── ExtractedSlide.java        # Per-slide content model
+│   │       └── ExtractedPresentation.java # Full deck model
+│   ├── chunker/
+│   │   ├── PptChunker.java                # Interface
+│   │   ├── SlideAwareChunker.java         # Default: one chunk per slide
+│   │   ├── DenseSlideChunker.java         # For text-heavy slides
+│   │   └── model/
+│   │       └── PptChunk.java              # Chunk with slide metadata
+│   ├── enricher/
+│   │   ├── ChunkEnricher.java             # Interface (reuse from pdf module)
+│   │   └── SlideContextEnricher.java      # Uses slide title + deck title
+│   ├── config/
+│   │   └── PptCrawlerConfig.java
+│   └── pipeline/
+│       ├── PptIngestionPipeline.java
+│       └── PipelineResult.java            # Reuse or extend PDF module's
+
+---
+
+## Dependencies (add to pom.xml)
+<dependencies>
+  <!-- Apache POI for .pptx -->
+  <dependency>
+    <groupId>org.apache.poi</groupId>
+    <artifactId>poi-ooxml</artifactId>
+    <version>5.3.0</version>
+  </dependency>
+
+  <!-- LangChain4j core (already in project) -->
+  <dependency>
+    <groupId>dev.langchain4j</groupId>
+    <artifactId>langchain4j</artifactId>
+    <version>0.32.0</version>
+  </dependency>
+
+  <!-- Token counting (already in project) -->
+  <dependency>
+    <groupId>com.knuddels</groupId>
+    <artifactId>jtokkit</artifactId>
+    <version>1.1.0</version>
+  </dependency>
+
+  <dependency>
+    <groupId>org.projectlombok</groupId>
+    <artifactId>lombok</artifactId>
+    <version>1.18.32</version>
+  </dependency>
+</dependencies>
+
+---
+
+## Key Difference vs PDF Module
+PPT content is SLIDE-STRUCTURED not page-flow. Each slide is a self-contained 
+unit with:
+  - A title (explicit, not inferred from font size)
+  - Bullet points (hierarchical, not paragraphs)
+  - Speaker notes (highly valuable — often more detailed than slide text)
+  - Visuals: charts, tables, images (need special handling)
+
+Chunking strategy: slide = natural chunk boundary (not token count).
+Token splitting is only fallback for abnormally dense slides.
+
+---
+
+## Model Definitions
+
+### ExtractedSlide.java
+@Data @Builder
+public class ExtractedSlide {
+    private int slideNumber;
+    private String title;                    // from title placeholder
+    private List<String> bulletPoints;       // hierarchical, preserve indent level
+    private String speakerNotes;             // from notes page
+    private List<String> tables;             // tables as markdown
+    private List<String> chartDescriptions;  // "Bar chart with title: X, axes: Y vs Z"
+    private boolean hasImages;               // flag only, no image extraction
+    private String layoutName;              // TITLE_SLIDE, CONTENT, BLANK etc.
+    private String rawText;                 // all text concatenated, fallback
+}
+
+### ExtractedPresentation.java
+@Data @Builder
+public class ExtractedPresentation {
+    private String sourceFile;
+    private String title;                   // from core properties
+    private String author;
+    private String subject;
+    private int totalSlides;
+    private List<ExtractedSlide> slides;
+    private Map<String, String> rawMetadata;
+}
+
+### PptChunk.java
+@Data @Builder
+public class PptChunk {
+    private String chunkId;                 // UUID
+    private String text;                    // assembled slide text
+    private String enrichedText;            // with context prefix
+    private int slideNumber;
+    private String slideTitle;
+    private String deckTitle;
+    private int chunkIndex;
+    private int totalChunks;
+    private String prevChunkId;
+    private String nextChunkId;
+    private String sourceFile;
+    private boolean includesSpeakerNotes;
+    private boolean isTable;
+    private int tokenCount;
+
+    public TextSegment toTextSegment() {
+        Metadata metadata = Metadata.from(Map.of(
+            "source",       sourceFile,
+            "slide",        String.valueOf(slideNumber),
+            "slideTitle",   slideTitle != null ? slideTitle : "",
+            "deckTitle",    deckTitle != null ? deckTitle : "",
+            "chunkId",      chunkId,
+            "prevChunk",    prevChunkId != null ? prevChunkId : "",
+            "nextChunk",    nextChunkId != null ? nextChunkId : "",
+            "hasNotes",     String.valueOf(includesSpeakerNotes)
+        ));
+        return TextSegment.from(
+            enrichedText != null ? enrichedText : text, metadata
+        );
+    }
+}
+
+---
+
+## Implementation Details
+
+### ApachePptExtractor.java
+Use Apache POI XMLSlideShow:
+
+XMLSlideShow pptx = new XMLSlideShow(new FileInputStream(path.toFile()));
+
+For each XSLFSlide:
+
+1. TITLE: getPlaceholder(0) → getText() → slide title
+   If null, try getPlaceholder(1) → first text shape → use as title
+
+2. BULLET POINTS: iterate getShapes() → XSLFTextShape
+   For each XSLFTextParagraph:
+     - getIndentLevel() gives hierarchy (0 = top, 1 = sub-bullet, etc.)
+     - Prefix with indent: "  ".repeat(indentLevel) + "• " + text
+     - Skip shapes that are the title placeholder
+
+3. SPEAKER NOTES: slide.getNotes()
+   If not null → getNotesParagraph() → extract text
+   Strip "Click to edit..." default placeholder text
+
+4. TABLES: XSLFTable shape
+   Iterate rows/cols → build markdown table string
+   | col1 | col2 |
+   |------|------|
+   | val  | val  |
+
+5. CHARTS: XSLFChart shape
+   Extract: chart.getChartSeries() title if available
+   Build string: "Chart: {title}, Type: {BAR|LINE|PIE}, 
+                  Categories: {list}, Series: {list}"
+   If chart metadata unavailable → "Chart present on slide {n}"
+
+6. IMAGES: just set hasImages = true, no extraction
+
+7. LAYOUT: slide.getSlideLayout().getType().name()
+
+8. RAW TEXT: concat all above as fallback
+
+Detect .ppt (legacy binary):
+  If file extension is .ppt → throw UnsupportedOperationException with message:
+  "Legacy .ppt format not supported. Please convert to .pptx first."
+
+Close XMLSlideShow in finally block.
+
+### SlideAwareChunker.java (default strategy)
+One chunk per slide — slides are natural semantic units:
+
+For each ExtractedSlide, assemble text in this order:
+  1. "Title: {title}"
+  2. Bullet points joined by \n (with indent preserved)
+  3. Tables (each as markdown block)
+  4. Chart descriptions
+  5. If config.includeSpeakerNotes == true:
+       "\n\n[Speaker Notes]\n{speakerNotes}"
+
+Check token count via JTokkit:
+  - If tokenCount <= config.chunkSize (default 512) → single PptChunk
+  - If tokenCount > 512 → split: 
+      Chunk A: title + bullets + tables (slide content)
+      Chunk B: "[Speaker Notes - Slide {n}]\n" + speakerNotes
+    Both chunks share same slideNumber, different chunkIndex
+
+Tables and charts: always separate chunk with isTable=true if they push
+slide over token limit.
+
+After all chunks → set prevChunkId / nextChunkId linked list.
+
+### DenseSlideChunker.java (fallback for text-heavy slides)
+Used when a single slide body exceeds 512 tokens even without notes:
+- Delegate bullet point text to RecursiveTokenChunker (reuse from pdf module)
+- Each sub-chunk inherits slideNumber and slideTitle
+- Prefix each sub-chunk: "[Slide {n} - Part {i}] {title}\n{text}"
+
+### SlideContextEnricher.java
+Inject ChatLanguageModel (same instance as PDF enricher):
+
+Prompt per chunk:
+"""
+Presentation: {deckTitle}
+Slide {slideNumber} of {totalSlides}: {slideTitle}
+Slide content: {first 300 chars of chunk.text}
+
+In one sentence (max 20 words), what is this slide communicating?
+"""
+
+Set chunk.enrichedText = "[Context: {response}]\n\n{chunk.text}"
+On failure → fall back to raw text, log warning, never fail pipeline.
+
+Special case: if slideTitle is non-null and chunk.text is short (< 100 tokens)
+→ skip LLM call, use:
+enrichedText = "[Slide {slideNumber}: {slideTitle}]\n\n{chunk.text}"
+
+### PptIngestionPipeline.java
+Constructor inject (same pattern as PDF pipeline):
+- PptExtractor extractor
+- PptChunker chunker
+- ChunkEnricher enricher              // nullable
+- EmbeddingStore<TextSegment> embeddingStore
+- EmbeddingModel embeddingModel
+- YourPersistenceService persistenceService
+
+ingest(Path pptPath):
+1. persistenceService.existsBySource() → skip if already processed
+2. ExtractedPresentation deck = extractor.extract(pptPath)
+3. List<PptChunk> chunks = chunker.chunk(deck)
+4. If enricher != null → enrich each chunk
+5. Embed → store in embeddingStore
+6. persistenceService.saveChunks(chunks)
+7. Return PipelineResult
+
+ingestDirectory(Path dir):
+- Glob *.pptx (warn and skip *.ppt files)
+- Call ingest() per file
+- Aggregate results
+
+### PptCrawlerConfig.java
+@Data
+public class PptCrawlerConfig {
+    private String chunkStrategy      = "slide";   // "slide" | "dense"
+    private int chunkSize             = 512;
+    private boolean includeSpeakerNotes = true;    // HIGH VALUE — keep true
+    private boolean enableEnrichment  = true;
+    private boolean recursiveScan     = false;
+}
+
+---
+
+## Assembly / Wiring
+
+PptIngestionPipeline pptPipeline = new PptIngestionPipeline(
+    new ApachePptExtractor(),
+    new SlideAwareChunker(config),
+    new SlideContextEnricher(existingChatModel),   // nullable
+    existingEmbeddingStore,                        // same as HTML + PDF
+    existingEmbeddingModel,
+    existingPersistenceService
+);
+
+PipelineResult result = pptPipeline.ingestDirectory(Path.of("/docs/slides"));
+
+---
+
+## Error Handling Rules
+- .ppt legacy file → log warning with conversion instruction, skip, continue
+- Password-protected .pptx → catch EncryptedDocumentException, skip
+- Slide with zero text (image-only) → store chunk with 
+  text="[IMAGE_ONLY_SLIDE_{n}]", set hasImages=true, continue
+- Chart with no metadata → store "Chart present on slide {n}", continue
+- Enrichment failure → fall back to raw text, never fail pipeline
+- All errors → PipelineResult.errors list
+
+## What NOT to build
+- Do not extract or store images/thumbnails
+- Do not support .ppt legacy binary format
+- Do not build query/retrieval layer
+- Do not reimplement embeddings store or persistence
+- Do not add Spring annotations
